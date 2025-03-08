@@ -6,18 +6,17 @@ use std::thread;
 use std::time::Instant;
 
 use crossbeam::epoch;
-use crossbeam::epoch::{Atomic, Collector, Owned};
+use crossbeam::epoch::{Atomic, Guard, Owned, Shared};
 use crossbeam::utils::{Backoff, CachePadded};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 
 fn main() {
-    let map = Arc::new(ConcurrentMap::new(8));
-
-    let collector = Collector::new();
-    collector.register();
+    let map = Arc::new(ConcurrentMap::new(64));
+    //let map = Arc::new(DashMap::new());
 
     let start = Instant::now();
+
     // Writers
     let mut workers = Vec::new();
     (0..32).for_each(|idx| {
@@ -28,7 +27,7 @@ fn main() {
                     let rng = rand::thread_rng();
                     let value: String = rng
                         .sample_iter(&Alphanumeric)
-                        .take(15)
+                        .take(3)
                         .map(char::from)
                         .collect();
                     map.insert(value.clone(), value.clone());
@@ -39,6 +38,27 @@ fn main() {
         workers.push(worker);
     });
 
+    // Readers
+    (0..8).for_each(|idx| {
+        let _ = thread::spawn({
+            let map = Arc::clone(&map);
+            move || {
+                (0..1000000).for_each(|idx| {
+                    let rng = rand::thread_rng();
+                    let value: String = rng
+                        .sample_iter(&Alphanumeric)
+                        .take(3)
+                        .map(char::from)
+                        .collect();
+                    map.get(&value, |val| {
+                        if val == "asdas" {
+                            println!("asd");
+                        }
+                    });
+                });
+            }
+        });
+    });
 
     loop {
         match workers.pop() {
@@ -54,7 +74,6 @@ fn main() {
 }
 
 
-#[derive(Debug)]
 struct ConcurrentMap<K, V>
 where
     K: Hash + Clone + PartialEq,
@@ -79,27 +98,64 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
     where
         F: Fn(&V) -> (),
     {
-        let slot = self.head.get_slot_unchecked(key);
-        let guard = epoch::pin();
-        let value = slot.value.load(Ordering::Relaxed, &guard);
-        if value.is_null() {
-            return;
-        }
-
-        let value_ref = &unsafe { value.as_ref().unwrap_unchecked() }.1;
-        f(value_ref);
-    }
-
-
-    pub fn insert(&self, key: K, value: V) {
         let guard = epoch::pin();
         let mut current_bucket = &self.head;
         let mut slot_ref: &Slot<K, V> = current_bucket.get_slot_unchecked(&key);
         loop {
-            let mut value_ref = slot_ref.value.load(Ordering::Acquire, &guard);
+            let mut value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
+            if !value_ref.is_null() {
+                let current_value = unsafe { value_ref.as_ref().unwrap_unchecked() };
+                if current_value.0.eq(&key) {
+                    f(&current_value.1);
+                    break;
+                }
+            }
+
+            let mut bucket_ref = slot_ref.bucket.load(Ordering::Relaxed, &guard);
+            if bucket_ref.is_null() {
+                break;
+            }
+
+            current_bucket = unsafe { bucket_ref.as_ref().unwrap_unchecked() };
+            slot_ref = current_bucket.get_slot_unchecked(&key);
+        }
+    }
+
+    pub fn remove(&self, key: &K)
+    {
+        let guard = epoch::pin();
+        let mut current_bucket = &self.head;
+        let mut slot_ref: &Slot<K, V> = current_bucket.get_slot_unchecked(&key);
+        loop {
+            let mut value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
+            if !value_ref.is_null() {
+                let current_value = unsafe { value_ref.as_ref().unwrap_unchecked() };
+                if current_value.0.eq(&key) {
+                    // Here swap is correct because the only thing can happen is replace by exactly the same key
+                    // Check memory orderings
+                    let value_old_ref = slot_ref.value.swap(Shared::null(), Ordering::SeqCst, &guard);
+                    Self::destroy(value_old_ref, &guard);
+                }
+            }
+
+            let mut bucket_ref = slot_ref.bucket.load(Ordering::Relaxed, &guard);
+            if bucket_ref.is_null() {
+                break;
+            }
+
+            current_bucket = unsafe { bucket_ref.as_ref().unwrap_unchecked() };
+            slot_ref = current_bucket.get_slot_unchecked(&key);
+        }
+    }
+    pub fn insert(&self, key: K, value: V) {
+        let guard = epoch::pin();
+        let mut current_bucket = &self.head;
+        let mut slot_ref: &Slot<K, V> = current_bucket.get_slot_unchecked(&key);
+        let new_value = Owned::new((key, value));
+        loop {
+            let mut value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
             if value_ref.is_null() {
-                let new_value = Owned::new((key.clone(), value.clone()));
-                let result = slot_ref.value.compare_exchange(value_ref, new_value, Ordering::Relaxed
+                let result = slot_ref.value.compare_exchange(value_ref, new_value.clone(), Ordering::Relaxed
                                                              , Ordering::Acquire, &guard);
                 if let Err(val) = result {
                     value_ref = val.current;
@@ -109,9 +165,12 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
             }
 
             let current_value = unsafe { value_ref.as_ref().unwrap_unchecked() };
-            if current_value.0.eq(&key) {
-                let new_value = Owned::new((key.clone(), value.clone()));
-                slot_ref.value.store(new_value, Ordering::Release);
+            let key_ref = &new_value.as_ref().0;
+            if current_value.0.eq(key_ref) {
+                // Could happen insertion of some value of different key in this bucket meanwhile? Change to compare and set?
+                // Maybe only if remove and insert happen between load and swapping, very strange but could happen, its the only case to not use swap here
+                let value_old_ref = slot_ref.value.swap(new_value, Ordering::SeqCst, &guard);
+                Self::destroy(value_old_ref, &guard);
                 break;
             }
 
@@ -137,19 +196,27 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
             }
 
             current_bucket = unsafe { bucket_ref.as_ref().unwrap_unchecked() };
-            slot_ref = current_bucket.get_slot_unchecked(&key);
+            slot_ref = current_bucket.get_slot_unchecked(key_ref);
+        }
+    }
+
+
+    fn destroy(pointer: Shared<(K, V)>, guard: &Guard) {
+        if !pointer.is_null() {
+            unsafe {
+                guard.defer_destroy(pointer);
+            }
         }
     }
 }
 
 
-#[derive(Debug)]
 struct Bucket<K, V>
 where
     K: Hash + Clone + PartialEq,
     V: Clone,
 {
-    slots: Vec<CachePadded<Slot<K, V>>>,
+    slots: Box<[CachePadded<Slot<K, V>>]>,
     capacity: u64,
     index_mask: u64,
     bucket_init_mask: AtomicU64,
@@ -161,7 +228,7 @@ impl<K: Hash + Clone + PartialEq, V: Clone> Bucket<K, V> {
         let slots = (1..=capacity)
             .map(|idx| CachePadded::new(Slot::new(idx)))
             .collect();
-        let hasher = RandomState::default();
+        let hasher = RandomState::new();
         Self {
             slots,
             capacity,
@@ -178,7 +245,6 @@ impl<K: Hash + Clone + PartialEq, V: Clone> Bucket<K, V> {
     }
 }
 
-#[derive(Debug)]
 struct Slot<K, V>
 where
     K: Hash + Clone + PartialEq,
