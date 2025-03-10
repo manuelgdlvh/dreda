@@ -93,7 +93,7 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
         }
     }
 
-    // Add deep look
+
     pub fn get<F>(&self, key: &K, f: F)
     where
         F: Fn(&V) -> (),
@@ -121,6 +121,7 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
         }
     }
 
+
     pub fn remove(&self, key: &K)
     {
         let guard = epoch::pin();
@@ -128,13 +129,15 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
         let mut slot_ref: &Slot<K, V> = current_bucket.get_slot_unchecked(&key);
         loop {
             let mut value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
+
             if !value_ref.is_null() {
                 let current_value = unsafe { value_ref.as_ref().unwrap_unchecked() };
+                // Best effort delete
+                // Continue to delete all possible orphan values
                 if current_value.0.eq(&key) {
-                    // Here swap is correct because the only thing can happen is replace by exactly the same key
-                    // Check memory orderings
-                    let value_old_ref = slot_ref.value.swap(Shared::null(), Ordering::SeqCst, &guard);
-                    Self::destroy(value_old_ref, &guard);
+                    if let Ok(_) = slot_ref.value.compare_exchange(value_ref, Shared::null(), Ordering::Relaxed, Ordering::Relaxed, &guard) {
+                        Self::destroy(value_ref, &guard);
+                    }
                 }
             }
 
@@ -151,27 +154,36 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
         let guard = epoch::pin();
         let mut current_bucket = &self.head;
         let mut slot_ref: &Slot<K, V> = current_bucket.get_slot_unchecked(&key);
-        let new_value = Owned::new((key, value));
+        let mut value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
+        let mut new_value = Owned::new((key, value));
         loop {
-            let mut value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
             if value_ref.is_null() {
-                let result = slot_ref.value.compare_exchange(value_ref, new_value.clone(), Ordering::Relaxed
-                                                             , Ordering::Acquire, &guard);
-                if let Err(val) = result {
-                    value_ref = val.current;
-                } else {
-                    break;
+                match slot_ref.value.compare_exchange(value_ref, new_value, Ordering::Relaxed, Ordering::Acquire, &guard) {
+                    Ok(_) => {
+                        break
+                    }
+                    Err(val) => {
+                        new_value = val.new;
+                        value_ref = val.current;
+                        continue;
+                    }
                 }
             }
 
             let current_value = unsafe { value_ref.as_ref().unwrap_unchecked() };
             let key_ref = &new_value.as_ref().0;
             if current_value.0.eq(key_ref) {
-                // Could happen insertion of some value of different key in this bucket meanwhile? Change to compare and set?
-                // Maybe only if remove and insert happen between load and swapping, very strange but could happen, its the only case to not use swap here
-                let value_old_ref = slot_ref.value.swap(new_value, Ordering::SeqCst, &guard);
-                Self::destroy(value_old_ref, &guard);
-                break;
+                match slot_ref.value.compare_exchange(value_ref, new_value, Ordering::Relaxed, Ordering::Acquire, &guard) {
+                    Ok(_) => {
+                        Self::destroy(value_ref, &guard);
+                        break;
+                    }
+                    Err(val) => {
+                        new_value = val.new;
+                        value_ref = val.current;
+                        continue;
+                    }
+                }
             }
 
             let mut bucket_ref = slot_ref.bucket.load(Ordering::Acquire, &guard);
@@ -197,6 +209,7 @@ impl<K: Hash + Clone + PartialEq, V: Clone> ConcurrentMap<K, V> {
 
             current_bucket = unsafe { bucket_ref.as_ref().unwrap_unchecked() };
             slot_ref = current_bucket.get_slot_unchecked(key_ref);
+            value_ref = slot_ref.value.load(Ordering::Relaxed, &guard);
         }
     }
 
@@ -225,7 +238,7 @@ where
 
 impl<K: Hash + Clone + PartialEq, V: Clone> Bucket<K, V> {
     pub fn new(capacity: u64) -> Self {
-        let slots = (1..=capacity)
+        let slots = (0..capacity)
             .map(|idx| CachePadded::new(Slot::new(idx)))
             .collect();
         let hasher = RandomState::new();
